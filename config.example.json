@@ -1,0 +1,16 @@
+{
+  "latitude": 55.6,
+  "longitude": 13.0,
+  "price_zone": "SE4",
+  "cheap_hours_per_day": 3,
+  "solar_ghi_threshold": 100,
+  "battery_charge_power": 3000,
+  "cron_secret": "change-this-to-a-random-string",
+  "isolarcloud": {
+    "username": "your@email.com",
+    "password": "your-isolarcloud-password",
+    "app_key": "your-app-key-from-developer-portal",
+    "app_secret": "your-app-secret-from-developer-portal",
+    "plant_id": "your-plant-id-from-isolarcloud-url"
+  }
+}
