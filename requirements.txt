@@ -1,3 +1,5 @@
 flask==2.0.3
 requests>=2.20.0
 backports.zoneinfo>=0.2.1
+pysolarcloud>=0.4.0
+aiohttp>=3.8.0
