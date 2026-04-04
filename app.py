@@ -11,7 +11,13 @@ Rules:
 
 Deployment: Phusion Passenger WSGI (simply.com / Python 3.6)
 Scheduling: simply.com URL cron -> hits /cron/run every hour
-iSolarCloud: Direct OAuth2 HTTP calls (no pysolarcloud library needed)
+
+iSolarCloud auth (from pysolarcloud source inspection):
+  - x-access-key header = APP_SECRET
+  - appkey in body      = APP_KEY
+  - Token endpoint      = /openapi/apiManage/token
+  - Refresh endpoint    = /openapi/apiManage/refreshToken
+  - Control endpoint    = /openapi/platform/paramSetting
 """
 
 from __future__ import annotations
@@ -140,9 +146,9 @@ def load_token():
     return None
 
 
-def save_token(tokens):
+def save_token(token):
     with open(str(TOKEN_FILE), "w") as f:
-        json.dump(tokens, f, indent=2, default=str)
+        json.dump(token, f, indent=2, default=str)
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +164,149 @@ def add_log(msg, level="info"):
         agent_state["log_entries"].insert(0, entry)
         agent_state["log_entries"] = agent_state["log_entries"][:200]
     getattr(log, level, log.info)(msg)
+
+
+# ---------------------------------------------------------------------------
+# iSolarCloud HTTP helpers
+# (reverse-engineered from pysolarcloud source)
+# ---------------------------------------------------------------------------
+
+def isolar_headers(app_secret, access_token=None):
+    """
+    x-access-key = APP_SECRET  (pysolarcloud: self.access_key = client_secret)
+    Authorization = Bearer {token}
+    """
+    h = {
+        "Content-Type": "application/json",
+        "x-access-key":  app_secret,
+    }
+    if access_token:
+        h["Authorization"] = "Bearer {}".format(access_token)
+    return h
+
+
+def isolar_body(data, app_key):
+    """
+    appkey in body = APP_KEY  (pysolarcloud: self.appkey = client_id)
+    lang = _en_US
+    """
+    body = dict(data)
+    body["appkey"] = app_key
+    body["lang"]   = "_en_US"
+    return body
+
+
+def isolar_post(path, data, iso_cfg, access_token=None):
+    """Make a request to iSolarCloud matching pysolarcloud exactly."""
+    resp = requests.post(
+        "{}{}".format(ISOLARCLOUD_BASE, path),
+        headers=isolar_headers(iso_cfg["app_secret"], access_token),
+        json=isolar_body(data, iso_cfg["app_key"]),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_valid_token(iso_cfg):
+    """Return a valid access token, refreshing if needed."""
+    token = load_token()
+    if not token:
+        return None
+
+    expires_at = token.get("expires_at", 0)
+    now        = int(datetime.now(timezone.utc).timestamp())
+
+    if expires_at - now < 60:
+        log.info("Token expiring — refreshing...")
+        try:
+            data = isolar_post(
+                "/openapi/apiManage/refreshToken",
+                {"refresh_token": token["refresh_token"]},
+                iso_cfg,
+            )
+            if "access_token" in data:
+                token.update(data)
+                token["expires_at"] = now + int(data.get("expires_in", 172799)) - 20
+                save_token(token)
+                log.info("Token refreshed successfully")
+            else:
+                log.error("Token refresh failed: {}".format(data))
+                return None
+        except Exception as e:
+            log.error("Token refresh error: {}".format(e))
+            return None
+
+    return token.get("access_token")
+
+
+def exchange_code_for_token(iso_cfg, code):
+    """Exchange OAuth2 authorization code for tokens."""
+    data = isolar_post(
+        "/openapi/apiManage/token",
+        {
+            "code":         code,
+            "grant_type":   "authorization_code",
+            "redirect_uri": iso_cfg["redirect_uri"],
+        },
+        iso_cfg,
+    )
+    log.info("Token exchange response: {}".format(data))
+    return data
+
+
+def set_battery_command(iso_cfg, command):
+    """
+    Set battery charge/discharge command.
+    command: 'Charge' | 'Stop' | 'Discharge'
+    Verified working with SH10RT-V112 (device_uuid=4033562).
+    param_code 10004 = charge_discharge_command
+    Values: Charge=170, Stop=204, Discharge=187
+    """
+    if not iso_cfg.get("app_key") or not iso_cfg.get("app_secret"):
+        log.warning("iSolarCloud not configured -- DRY RUN")
+        return {"status": "dry_run", "command": command}
+
+    access_token = get_valid_token(iso_cfg)
+    if not access_token:
+        log.error("No valid token -- visit /auth/start to re-authorize")
+        return {"status": "error", "msg": "no valid token"}
+
+    value_map = {"Charge": "170", "Discharge": "187", "Stop": "204"}
+    set_value  = value_map.get(command, "204")
+
+    try:
+        result = isolar_post(
+            "/openapi/platform/paramSetting",
+            {
+                "set_type":      0,
+                "uuid":          str(iso_cfg["device_uuid"]),
+                "task_name":     "BatteryAgent {}".format(
+                    datetime.now().strftime("%Y-%m-%d %H:%M")),
+                "expire_second": 120,
+                "param_list":    [{"param_code": "10004", "set_value": set_value}],
+            },
+            iso_cfg,
+            access_token,
+        )
+
+        success = (
+            result.get("result_code") == "1"
+            and result.get("result_data", {}).get("check_result") == "1"
+            and result.get("result_data", {}).get(
+                "dev_result_list", [{}])[0].get("code") == "1"
+        )
+
+        if success:
+            log.info("Battery set to {} OK".format(command))
+            return {"status": "ok", "command": command}
+        else:
+            log.error("Battery command failed: {}".format(result))
+            return {"status": "error", "msg": str(result)}
+
+    except Exception as e:
+        log.error("set_battery_command failed: {}".format(e))
+        return {"status": "error", "msg": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -272,155 +421,12 @@ def compute_schedule(cfg, prices, solar):
 
 
 # ---------------------------------------------------------------------------
-# iSolarCloud — direct OAuth2 HTTP calls (no external library)
-# ---------------------------------------------------------------------------
-
-def isolarcloud_headers(app_key, app_secret, access_token=None):
-    """Build request headers for iSolarCloud API calls."""
-    h = {
-        "Content-Type":    "application/json",
-        "x-access-key":    app_key,
-        "x-access-secret": app_secret,
-    }
-    if access_token:
-        h["Authorization"] = "Bearer {}".format(access_token)
-    return h
-
-
-def exchange_code_for_token(iso_cfg, code):
-    """Exchange OAuth2 authorization code for access + refresh tokens."""
-    client_id = "{}@{}".format(iso_cfg["app_id"], iso_cfg["app_key"])
-    resp = requests.post(
-        "{}/openapi/platform/oauth2/token".format(ISOLARCLOUD_BASE),
-        headers=isolarcloud_headers(iso_cfg["app_key"], iso_cfg["app_secret"]),
-        json={
-            "grant_type":    "authorization_code",
-            "code":          code,
-            "redirect_uri":  iso_cfg["redirect_uri"],
-            "client_id":     client_id,
-            "client_secret": iso_cfg["app_secret"],
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    log.info("Token exchange response: {}".format(data))
-    return data
-
-
-def refresh_access_token(iso_cfg, refresh_token):
-    """Use refresh token to get a new access token."""
-    client_id = "{}@{}".format(iso_cfg["app_id"], iso_cfg["app_key"])
-    resp = requests.post(
-        "{}/openapi/platform/oauth2/token".format(ISOLARCLOUD_BASE),
-        headers=isolarcloud_headers(iso_cfg["app_key"], iso_cfg["app_secret"]),
-        json={
-            "grant_type":    "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id":     client_id,
-            "client_secret": iso_cfg["app_secret"],
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_valid_token(iso_cfg):
-    """
-    Return a valid access token, refreshing if needed.
-    Saves updated token back to disk.
-    Returns None if no token available.
-    """
-    token = load_token()
-    if not token:
-        return None
-
-    # Check expiry (with 60s buffer)
-    expires_at = token.get("expires_at", 0)
-    now        = int(datetime.now(timezone.utc).timestamp())
-
-    if expires_at - now < 60:
-        log.info("Access token expired — refreshing...")
-        try:
-            new_token = refresh_access_token(iso_cfg, token["refresh_token"])
-            # Merge and save
-            token.update(new_token)
-            if "expires_in" in new_token:
-                token["expires_at"] = now + int(new_token["expires_in"]) - 20
-            save_token(token)
-            log.info("Token refreshed successfully")
-        except Exception as e:
-            log.error("Token refresh failed: {}".format(e))
-            return None
-
-    return token.get("access_token")
-
-
-def set_battery_command(iso_cfg, command):
-    """
-    Set the battery charge/discharge command directly via iSolarCloud API.
-
-    command: 'Charge' | 'Stop' | 'Discharge'
-
-    Uses the same endpoint pysolarcloud uses, but with direct HTTP calls.
-    Verified working with device_uuid=4033562 (SH10RT-V112).
-    """
-    if not iso_cfg.get("app_key") or not iso_cfg.get("app_secret"):
-        log.warning("iSolarCloud not configured -- DRY RUN")
-        return {"status": "dry_run", "command": command}
-
-    access_token = get_valid_token(iso_cfg)
-    if not access_token:
-        log.error("No valid token -- re-authorize at /auth/start")
-        return {"status": "error", "msg": "no valid token"}
-
-    # Parameter codes discovered from pysolarcloud inspection:
-    # charge_discharge_command -> code 10004
-    # Values: Charge=170, Discharge=187, Stop=204
-    value_map = {"Charge": "170", "Discharge": "187", "Stop": "204"}
-    set_value = value_map.get(command, "204")
-
-    payload = {
-        "set_type":      0,
-        "uuid":          str(iso_cfg["device_uuid"]),
-        "task_name":     "BatteryAgent {}".format(
-            datetime.now().strftime("%Y-%m-%d %H:%M")),
-        "expire_second": 120,
-        "param_list": [
-            {"param_code": "10004", "set_value": set_value}
-        ],
-    }
-
-    try:
-        resp = requests.post(
-            "{}/openapi/platform/paramSetting".format(ISOLARCLOUD_BASE),
-            headers=isolarcloud_headers(
-                iso_cfg["app_key"], iso_cfg["app_secret"], access_token),
-            json=payload,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        log.info("set_battery_command={} response={}".format(command, data))
-        return {"status": "ok", "command": command, "response": data}
-    except Exception as e:
-        log.error("set_battery_command failed: {}".format(e))
-        return {"status": "error", "msg": str(e)}
-
-
-# ---------------------------------------------------------------------------
 # Core agent
 # ---------------------------------------------------------------------------
 _agent_lock = threading.Lock()
 
 
 def run_agent(cfg=None, manual=False):
-    """
-    Core tick. Called from:
-      - GET /cron/run  (simply.com URL cron, every hour)
-      - POST /api/run  (web UI Run Now button)
-    """
     if not _agent_lock.acquire(blocking=False):
         add_log("Agent already running -- skipped", "warning")
         return
@@ -436,7 +442,6 @@ def run_agent(cfg=None, manual=False):
             "[MANUAL] " if manual else "",
             now.strftime("%Y-%m-%d %H:%M")))
 
-        # 1. Fetch data
         prices = fetch_spot_prices(cfg["price_zone"], now)
         solar  = fetch_solar_forecast(cfg["latitude"], cfg["longitude"], now)
 
@@ -444,7 +449,6 @@ def run_agent(cfg=None, manual=False):
             add_log("No price data -- aborting", "warning")
             return
 
-        # 2. Compute schedule
         schedule = compute_schedule(cfg, prices, solar)
         slot     = next((s for s in schedule if s["hour"] == current_hour),
                         None)
@@ -457,13 +461,12 @@ def run_agent(cfg=None, manual=False):
             add_log("No slot for hour {}".format(current_hour), "warning")
             return
 
-        mode = slot["mode"]
-        add_log("Hour {}: {} -- {}".format(current_hour, mode, slot["reason"]))
-
-        # 3. Map mode to battery command
+        mode    = slot["mode"]
         command = "Charge" if mode == "grid_charge" else "Stop"
 
-        # 4. Apply to battery
+        add_log("Hour {}: {} -> {} | {}".format(
+            current_hour, mode, command, slot["reason"]))
+
         result = set_battery_command(cfg["isolarcloud"], command)
 
         with state_lock:
@@ -474,12 +477,11 @@ def run_agent(cfg=None, manual=False):
         if result.get("status") == "ok":
             add_log("Battery set to: {}".format(command))
         elif result.get("status") == "dry_run":
-            add_log("DRY RUN -- iSolarCloud not configured")
+            add_log("DRY RUN -- credentials not configured")
         else:
             add_log("Battery control failed: {}".format(
                 result.get("msg")), "error")
 
-        # 5. Persist state
         with state_lock:
             save_state(agent_state)
 
@@ -511,7 +513,7 @@ def cron_run():
 
 @app.route("/auth/start")
 def auth_start():
-    """Redirect browser to iSolarCloud authorization page."""
+    """Redirect to iSolarCloud authorization page."""
     cfg = load_config()
     iso = cfg["isolarcloud"]
     url = (
@@ -525,11 +527,7 @@ def auth_start():
 
 @app.route("/auth/callback")
 def auth_callback():
-    """
-    OAuth2 redirect handler.
-    iSolarCloud sends user here with ?code=XXX after approval.
-    We exchange the code for a token and save it.
-    """
+    """Receive OAuth2 code and exchange for token."""
     code = request.args.get("code")
     if not code:
         return "Missing code parameter", 400
@@ -538,21 +536,22 @@ def auth_callback():
     iso = cfg["isolarcloud"]
 
     if not iso.get("app_key") or not iso.get("app_secret"):
-        return "iSolarCloud credentials not configured in config.json", 500
+        return "iSolarCloud not configured in config.json", 500
 
     try:
         data = exchange_code_for_token(iso, code)
 
-        # Build token dict with expiry
-        now = int(datetime.now(timezone.utc).timestamp())
+        if "access_token" not in data:
+            return "Token exchange failed: {}".format(data), 500
+
+        now   = int(datetime.now(timezone.utc).timestamp())
         token = {
-            "access_token":  data.get("access_token"),
-            "refresh_token": data.get("refresh_token"),
+            "access_token":  data["access_token"],
+            "refresh_token": data["refresh_token"],
             "expires_at":    now + int(data.get("expires_in", 172799)) - 20,
-            "raw":           data,
         }
         save_token(token)
-        add_log("OAuth2 token obtained and saved via /auth/callback")
+        add_log("OAuth2 token saved via /auth/callback")
 
         return (
             "<h2>Authorization successful!</h2>"
