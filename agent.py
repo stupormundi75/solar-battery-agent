@@ -36,7 +36,7 @@ except ImportError:
 BASE_DIR    = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "config.json"
 TOKEN_FILE  = BASE_DIR / "token.json"
-STATUS_FILE = BASE_DIR / "public" / "status.json"
+STATUS_FILE = Path("/var/www/godaly.com/battery/status.json")
 LOG_FILE    = BASE_DIR / "logs" / "agent.log"
 LOG_FILE.parent.mkdir(exist_ok=True)
 STATUS_FILE.parent.mkdir(exist_ok=True)
