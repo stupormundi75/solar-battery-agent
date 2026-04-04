@@ -4,13 +4,21 @@
   "price_zone": "SE4",
   "cheap_hours_per_day": 3,
   "solar_ghi_threshold": 100,
-  "cron_secret": "change-this-to-a-random-string",
+  "dry_run": false,
+  "notify_email": "your@email.com",
+  "smtp": {
+    "host":     "mail.godaly.com",
+    "port":     587,
+    "username": "your@godaly.com",
+    "password": "your-email-password",
+    "from":     "battery-agent@godaly.com"
+  },
   "isolarcloud": {
-    "app_key":     "your-app-key-from-developer-portal",
-    "app_secret":  "your-app-secret-from-developer-portal",
-    "app_id":      "3251",
-    "plant_id":    "5486815",
-    "device_uuid": "4033562",
+    "app_key":      "your-app-key",
+    "app_secret":   "your-app-secret",
+    "app_id":       "3251",
+    "plant_id":     "5486815",
+    "device_uuid":  "4033562",
     "redirect_uri": "https://battery.godaly.com/auth/callback"
   }
 }
