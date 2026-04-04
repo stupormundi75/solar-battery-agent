@@ -43,27 +43,59 @@
   .mode-grid_charge{background:var(--grid-dim); color:var(--grid);}
   .mode-normal     {background:var(--normal-dim);color:var(--normal);}
 
-  .timeline{display:grid;grid-template-columns:repeat(24,1fr);gap:3px;height:80px;align-items:end;margin-top:16px;}
-  .bar{border-radius:4px 4px 0 0;min-height:4px;position:relative;}
+  /* Chart containers — taller to fit labels */
+  .chart-wrap{position:relative;margin-top:16px;}
+  .chart-bars{display:grid;grid-template-columns:repeat(24,1fr);gap:3px;height:100px;align-items:end;}
+
+  /* Individual bar wrapper — holds bar + label */
+  .bw{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;}
+
+  /* Rotated value label inside bar */
+  .blabel{
+    writing-mode:vertical-rl;
+    text-orientation:mixed;
+    transform:rotate(180deg);
+    font-family:'DM Mono',monospace;
+    font-size:7px;
+    line-height:1;
+    padding:2px 0;
+    overflow:hidden;
+    max-height:90px;
+    color:rgba(0,0,0,0.7);
+    user-select:none;
+    pointer-events:none;
+  }
+
+  /* The coloured bar itself */
+  .bar{
+    width:100%;
+    border-radius:4px 4px 0 0;
+    min-height:4px;
+    position:relative;
+    display:flex;
+    align-items:flex-end;
+    justify-content:center;
+    overflow:hidden;
+    cursor:default;
+    transition:opacity 0.15s;
+  }
+  .bar:hover{opacity:0.75;}
   .bar.solar      {background:var(--solar);}
   .bar.grid_charge{background:var(--grid);}
   .bar.normal     {background:var(--bg3);border:1px solid var(--border);}
   .bar.current    {outline:2px solid white;outline-offset:1px;}
-  .bar:hover::after{content:attr(data-tip);position:absolute;bottom:calc(100% + 4px);left:50%;transform:translateX(-50%);background:var(--bg3);color:var(--text);border:1px solid var(--border);padding:3px 7px;border-radius:5px;font-family:'DM Mono',monospace;font-size:9px;white-space:nowrap;pointer-events:none;z-index:10;}
 
-  .hours{display:grid;grid-template-columns:repeat(24,1fr);gap:3px;margin-top:6px;}
+  /* Light label on dark normal bars */
+  .bar.normal .blabel{color:var(--muted);}
+
+  .hours{display:grid;grid-template-columns:repeat(24,1fr);gap:3px;margin-top:4px;}
   .hours span{font-family:'DM Mono',monospace;font-size:8px;color:var(--muted);text-align:center;}
-
-  .pchart{display:grid;grid-template-columns:repeat(24,1fr);gap:3px;height:60px;align-items:end;margin-top:12px;}
-  .pbar{border-radius:3px 3px 0 0;min-height:3px;position:relative;}
-  .pbar:hover::after{content:attr(data-tip);position:absolute;bottom:calc(100% + 4px);left:50%;transform:translateX(-50%);background:var(--bg3);color:var(--text);border:1px solid var(--border);padding:3px 7px;border-radius:5px;font-family:'DM Mono',monospace;font-size:9px;white-space:nowrap;pointer-events:none;z-index:10;}
 
   .legend{display:flex;gap:20px;margin-top:12px;flex-wrap:wrap;}
   .legend-item{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);}
   .legend-dot{width:8px;height:8px;border-radius:2px;}
 
   .dry-run-banner{background:var(--solar-dim);border:1px solid var(--solar);color:var(--solar);padding:10px 16px;border-radius:8px;font-family:'DM Mono',monospace;font-size:12px;margin-bottom:16px;}
-
   .error-banner{background:var(--warn-dim);border:1px solid var(--warn);color:var(--warn);padding:16px 20px;border-radius:12px;margin-bottom:16px;font-size:14px;}
 </style>
 </head>
@@ -83,7 +115,6 @@
   <div id="dry-run-banner" class="dry-run-banner" style="display:none">
     ⚠ DRY RUN MODE — agent is running but not sending commands to battery
   </div>
-
   <div id="error-banner" class="error-banner" style="display:none"></div>
 
   <div class="grid-3">
@@ -104,21 +135,27 @@
     </div>
   </div>
 
+  <!-- Timeline -->
   <div class="card grid-full">
-    <div class="card-label">Today's Schedule — 24h</div>
-    <div class="timeline" id="timeline"></div>
+    <div class="card-label">Today's Schedule — 24h (W/m²)</div>
+    <div class="chart-wrap">
+      <div class="chart-bars" id="timeline"></div>
+    </div>
     <div class="hours" id="hours"></div>
     <div class="legend">
-      <div class="legend-item"><div class="legend-dot" style="background:var(--solar)"></div>Solar</div>
-      <div class="legend-item"><div class="legend-dot" style="background:var(--grid)"></div>Grid charge</div>
-      <div class="legend-item"><div class="legend-dot" style="background:var(--bg3);border:1px solid var(--border)"></div>Normal</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--solar)"></div>Solar (panels charging)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--grid)"></div>Grid charge (cheap hour)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--bg3);border:1px solid var(--border)"></div>Normal / self-consumption</div>
     </div>
   </div>
 
+  <!-- Price + Solar charts -->
   <div class="grid-2">
     <div class="card">
       <div class="card-label">Prices — SE4 (öre/kWh)</div>
-      <div class="pchart" id="price-chart"></div>
+      <div class="chart-wrap">
+        <div class="chart-bars" id="price-chart"></div>
+      </div>
       <div class="hours" id="price-hours"></div>
       <div class="legend">
         <div class="legend-item"><div class="legend-dot" style="background:var(--normal)"></div>Cheap → charge</div>
@@ -128,8 +165,14 @@
     </div>
     <div class="card">
       <div class="card-label">Solar Forecast (W/m²)</div>
-      <div class="pchart" id="solar-chart"></div>
+      <div class="chart-wrap">
+        <div class="chart-bars" id="solar-chart"></div>
+      </div>
       <div class="hours" id="solar-hours"></div>
+      <div class="legend">
+        <div class="legend-item"><div class="legend-dot" style="background:var(--solar)"></div>Above threshold (solar mode)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:rgba(255,255,255,0.12)"></div>Below threshold</div>
+      </div>
     </div>
   </div>
 
@@ -143,99 +186,117 @@ async function load() {
   try {
     const r = await fetch('status.json?t=' + Date.now());
     if (!r.ok) {
-      document.getElementById('error-banner').style.display = 'block';
-      document.getElementById('error-banner').textContent =
-        'status.json not found — agent has not run yet. Check cron setup.';
+      showError('status.json not found — agent has not run yet.');
       return;
     }
-    const d = await r.json();
-    render(d);
+    render(await r.json());
   } catch(e) {
-    document.getElementById('error-banner').style.display = 'block';
-    document.getElementById('error-banner').textContent = 'Failed to load status.json: ' + e;
+    showError('Failed to load status.json: ' + e);
   }
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-banner');
+  el.style.display = 'block';
+  el.textContent = msg;
+}
+
+function makeBar(bgColor, heightPx, label, isCurrent, extraClass) {
+  const cur = isCurrent ? ' current' : '';
+  const cls = extraClass ? (' ' + extraClass) : '';
+  // Only show label if bar is tall enough
+  const labelHtml = (heightPx >= 18 && label)
+    ? `<span class="blabel">${label}</span>`
+    : '';
+  return `<div class="bw">
+    <div class="bar${cur}${cls}" style="height:${heightPx}px;background:${bgColor}">
+      ${labelHtml}
+    </div>
+  </div>`;
 }
 
 function render(d) {
   const currentHour = new Date().getHours();
 
-  // Header
   document.getElementById('last-run').textContent =
     'Last run: ' + new Date(d.last_run).toLocaleString('sv-SE');
 
-  // Dry run banner
-  if (d.dry_run) {
-    document.getElementById('dry-run-banner').style.display = 'block';
-  }
-
-  // Error banner
-  if (d.result && d.result.status === 'error') {
-    document.getElementById('error-banner').style.display = 'block';
-    document.getElementById('error-banner').textContent =
-      '⚠ Last action failed: ' + (d.result.msg || 'unknown error');
-  }
+  if (d.dry_run) document.getElementById('dry-run-banner').style.display = 'block';
+  if (d.result && d.result.status === 'error')
+    showError('⚠ Last action failed: ' + (d.result.msg || 'unknown error'));
 
   // Mode badge
   const badge = document.getElementById('mode-badge');
   const emoji = {solar:'☀️', grid_charge:'⚡', normal:'🔋'}[d.mode] || '·';
-  const label = d.mode.replace('_',' ').replace(/\b\w/g, c=>c.toUpperCase());
   badge.className = 'mode-badge mode-' + d.mode;
-  badge.innerHTML = emoji + ' ' + label;
+  badge.innerHTML = emoji + ' ' + d.mode.replace('_',' ').replace(/\b\w/g,c=>c.toUpperCase());
   document.getElementById('reason').textContent = d.reason;
 
-  // Stats
   const pEl = document.getElementById('price');
   pEl.textContent = d.price_ore != null ? d.price_ore.toFixed(1) : '—';
-  pEl.style.color = d.mode === 'grid_charge' ? 'var(--grid)' : 'var(--text)';
+  pEl.style.color = d.mode==='grid_charge'?'var(--grid)':'var(--text)';
 
   const gEl = document.getElementById('ghi');
   gEl.textContent = d.ghi_W_m2 != null ? d.ghi_W_m2.toFixed(0) : '—';
-  gEl.style.color = d.mode === 'solar' ? 'var(--solar)' : 'var(--text)';
+  gEl.style.color = d.mode==='solar'?'var(--solar)':'var(--text)';
 
   if (!d.schedule || !d.schedule.length) return;
   const s = d.schedule;
 
-  // Timeline
+  // ---- Timeline (mode coloured, label = GHI W/m²) ----
   const maxGhi = Math.max(...s.map(x=>x.ghi_W_m2), 1);
+  const modeColors = {
+    solar:       'var(--solar)',
+    grid_charge: 'var(--grid)',
+    normal:      null,   // use class
+  };
+
   document.getElementById('timeline').innerHTML = s.map(x => {
-    const h = x.mode==='normal' ? 20 : Math.max((x.ghi_W_m2/maxGhi)*76, 20);
-    const cur = x.hour===currentHour ? ' current' : '';
-    const tip = String(x.hour).padStart(2,'0')+':00 · '+x.mode;
-    return `<div class="bar ${x.mode}${cur}" style="height:${h}px" data-tip="${tip}"></div>`;
+    const h   = x.mode==='normal' ? 14 : Math.max((x.ghi_W_m2/maxGhi)*96, 14);
+    const bg  = modeColors[x.mode] || 'var(--bg3)';
+    const lbl = x.ghi_W_m2 > 0 ? x.ghi_W_m2.toFixed(0) : '';
+    const extraCls = x.mode==='normal' ? 'normal' : x.mode;
+    return makeBar(bg, h, lbl, x.hour===currentHour, extraCls);
   }).join('');
 
   document.getElementById('hours').innerHTML = s.map(x =>
     `<span style="${x.hour===currentHour?'color:var(--text)':''}">${String(x.hour).padStart(2,'0')}</span>`
   ).join('');
 
-  // Price chart
+  // ---- Price chart (label = öre) ----
   const valid = s.filter(x=>x.price_SEK!=null);
   if (valid.length) {
     const maxP = Math.max(...valid.map(x=>x.price_SEK));
     const minP = Math.min(...valid.map(x=>x.price_SEK));
-    const range = maxP-minP || 0.01;
+    const range = maxP - minP || 0.01;
+
     document.getElementById('price-chart').innerHTML = s.map(x => {
-      if (x.price_SEK==null) return '<div class="pbar" style="height:4px;background:rgba(255,255,255,0.05)"></div>';
-      const h = ((x.price_SEK-minP)/range)*56+4;
-      const bg = x.mode==='grid_charge'?'var(--normal)':x.mode==='solar'?'var(--solar)':'rgba(255,255,255,0.12)';
-      const cur = x.hour===currentHour?' current':'';
-      const tip = String(x.hour).padStart(2,'0')+':00 · '+(x.price_SEK*100).toFixed(1)+' öre';
-      return `<div class="pbar${cur}" style="height:${h}px;background:${bg}" data-tip="${tip}"></div>`;
+      if (x.price_SEK == null) return '<div class="bw"><div class="bar normal" style="height:4px"></div></div>';
+      const h   = Math.max(((x.price_SEK-minP)/range)*92+8, 8);
+      const lbl = (x.price_SEK*100).toFixed(1);
+      let bg, cls;
+      if (x.mode==='grid_charge') { bg='var(--normal)'; cls=''; }
+      else if (x.mode==='solar')  { bg='var(--solar)';  cls=''; }
+      else                        { bg='rgba(255,255,255,0.12)'; cls='normal'; }
+      return makeBar(bg, h, lbl, x.hour===currentHour, cls);
     }).join('');
+
     document.getElementById('price-hours').innerHTML = s.map(x =>
       `<span style="${x.hour===currentHour?'color:var(--text)':''}">${String(x.hour).padStart(2,'0')}</span>`
     ).join('');
   }
 
-  // Solar chart
+  // ---- Solar chart (label = W/m²) ----
   const maxG = Math.max(...s.map(x=>x.ghi_W_m2), 100);
   document.getElementById('solar-chart').innerHTML = s.map(x => {
-    const h = (x.ghi_W_m2/maxG)*56+4;
-    const above = x.mode==='solar';
-    const cur = x.hour===currentHour?' current':'';
-    const tip = String(x.hour).padStart(2,'0')+':00 · '+x.ghi_W_m2+' W/m²';
-    return `<div class="pbar${cur}" style="height:${h}px;background:${above?'var(--solar)':'rgba(255,255,255,0.12)'}" data-tip="${tip}"></div>`;
+    const h    = Math.max((x.ghi_W_m2/maxG)*96, 4);
+    const above = x.mode === 'solar';
+    const bg   = above ? 'var(--solar)' : 'rgba(255,255,255,0.12)';
+    const cls  = above ? 'solar' : 'normal';
+    const lbl  = x.ghi_W_m2 > 0 ? x.ghi_W_m2.toFixed(0) : '';
+    return makeBar(bg, h, lbl, x.hour===currentHour, cls);
   }).join('');
+
   document.getElementById('solar-hours').innerHTML = s.map(x =>
     `<span style="${x.hour===currentHour?'color:var(--text)':''}">${String(x.hour).padStart(2,'0')}</span>`
   ).join('');
