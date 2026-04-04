@@ -36,7 +36,7 @@ except ImportError:
 BASE_DIR    = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "config.json"
 TOKEN_FILE  = BASE_DIR / "token.json"
-STATUS_FILE = Path("/var/www/godaly.com/battery/status.json")
+STATUS_FILE = BASE_DIR / "public" / "status.json"
 LOG_FILE    = BASE_DIR / "logs" / "agent.log"
 LOG_FILE.parent.mkdir(exist_ok=True)
 STATUS_FILE.parent.mkdir(exist_ok=True)
@@ -263,14 +263,17 @@ def fetch_spot_prices(zone, date):
 
 
 def fetch_solar_forecast(lat, lon, date):
-    date_str = date.strftime("%Y-%m-%d")
+    """Fetch 48h solar forecast (today + tomorrow)."""
+    from datetime import timedelta
+    date_str      = date.strftime("%Y-%m-%d")
+    tomorrow_str  = (date + timedelta(days=1)).strftime("%Y-%m-%d")
     url = (
         "https://api.open-meteo.com/v1/forecast"
         "?latitude={}&longitude={}"
         "&hourly=shortwave_radiation"
         "&start_date={}&end_date={}"
         "&timezone=Europe/Stockholm"
-    ).format(lat, lon, date_str, date_str)
+    ).format(lat, lon, date_str, tomorrow_str)
     try:
         r = requests.get(url, timeout=10)
         r.raise_for_status()
@@ -278,7 +281,12 @@ def fetch_solar_forecast(lat, lon, date):
         times = data["hourly"]["time"]
         ghi   = data["hourly"]["shortwave_radiation"]
         return [
-            {"hour": datetime.fromisoformat(t).hour, "ghi": round(g or 0, 1)}
+            {
+                "datetime": t,
+                "date":     t[:10],
+                "hour":     datetime.fromisoformat(t).hour,
+                "ghi":      round(g or 0, 1),
+            }
             for t, g in zip(times, ghi)
         ]
     except Exception as e:
@@ -289,11 +297,12 @@ def fetch_solar_forecast(lat, lon, date):
 # Decision logic
 # ---------------------------------------------------------------------------
 
-def compute_schedule(cfg, prices, solar):
+def compute_schedule_for_day(cfg, prices, solar_slots):
+    """Compute 24-slot schedule for a single day."""
     threshold = cfg["solar_ghi_threshold"]
     n_cheap   = cfg["cheap_hours_per_day"]
 
-    ghi_by_hour   = {h["hour"]: h["ghi"] for h in solar}
+    ghi_by_hour   = {s["hour"]: s["ghi"] for s in solar_slots}
     price_by_hour = {p["hour"]: p["SEK_per_kWh"] for p in prices}
 
     solar_hours = {h for h, g in ghi_by_hour.items() if g >= threshold}
@@ -304,7 +313,7 @@ def compute_schedule(cfg, prices, solar):
     cheap_hours = {h for h, _ in non_solar_prices[:n_cheap]}
     cheap_rank  = {h: i+1 for i, (h, _) in enumerate(non_solar_prices)}
 
-    schedule = []
+    slots = []
     for hour in range(24):
         price = price_by_hour.get(hour)
         ghi   = ghi_by_hour.get(hour, 0)
@@ -320,14 +329,21 @@ def compute_schedule(cfg, prices, solar):
             mode   = "normal"
             reason = "Self-consumption"
 
-        schedule.append({
+        slots.append({
             "hour":      hour,
             "price_SEK": round(price, 4) if price is not None else None,
             "ghi_W_m2":  ghi,
             "mode":      mode,
             "reason":    reason,
         })
-    return schedule
+    return slots
+
+
+def compute_schedule(cfg, prices, solar):
+    """Compute today schedule (used for battery control)."""
+    today = solar[0]["date"] if solar and "date" in solar[0] else None
+    today_solar = [s for s in solar if s.get("date") == today] if today else solar
+    return compute_schedule_for_day(cfg, prices, today_solar)
 
 # ---------------------------------------------------------------------------
 # Email notification
@@ -377,17 +393,29 @@ def main():
 
     log.info("Agent tick — {}".format(now.strftime("%Y-%m-%d %H:%M")))
 
-    # 1. Fetch data
-    prices = fetch_spot_prices(cfg["price_zone"], now)
-    solar  = fetch_solar_forecast(cfg["latitude"], cfg["longitude"], now)
+    from datetime import timedelta
 
-    if not prices:
+    # 1. Fetch today's data
+    tomorrow     = now + timedelta(days=1)
+    prices_today = fetch_spot_prices(cfg["price_zone"], now)
+    prices_tmrw  = fetch_spot_prices(cfg["price_zone"], tomorrow)
+    solar_48h    = fetch_solar_forecast(cfg["latitude"], cfg["longitude"], now)
+
+    if not prices_today:
         log.error("No price data — aborting")
         return
 
-    # 2. Compute schedule
-    schedule = compute_schedule(cfg, prices, solar)
-    slot     = next((s for s in schedule if s["hour"] == current_hour), None)
+    # Split solar into today/tomorrow
+    today_str    = now.strftime("%Y-%m-%d")
+    tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+    solar_today  = [s for s in solar_48h if s.get("date") == today_str]
+    solar_tmrw   = [s for s in solar_48h if s.get("date") == tomorrow_str]
+
+    # 2. Compute schedules
+    schedule_today = compute_schedule_for_day(cfg, prices_today, solar_today)
+    schedule_tmrw  = compute_schedule_for_day(cfg, prices_tmrw,  solar_tmrw) if prices_tmrw else []
+
+    slot = next((s for s in schedule_today if s["hour"] == current_hour), None)
 
     if not slot:
         log.error("No schedule slot for hour {}".format(current_hour))
@@ -405,19 +433,22 @@ def main():
     dry_run = cfg.get("dry_run", False)
     result  = set_battery_command(cfg["isolarcloud"], command, dry_run=dry_run)
 
-    # 4. Write status.json
+    # 4. Write status.json (includes both days for dashboard)
     status = {
-        "last_run":    now.isoformat(),
-        "current_hour": current_hour,
-        "mode":        mode,
-        "command":     command,
-        "reason":      slot["reason"],
-        "price_SEK":   price,
-        "price_ore":   round(price * 100, 1) if price else None,
-        "ghi_W_m2":    ghi,
-        "result":      result,
-        "schedule":    schedule,
-        "dry_run":     dry_run,
+        "last_run":       now.isoformat(),
+        "current_hour":   current_hour,
+        "today":          today_str,
+        "tomorrow":       tomorrow_str,
+        "mode":           mode,
+        "command":        command,
+        "reason":         slot["reason"],
+        "price_SEK":      price,
+        "price_ore":      round(price * 100, 1) if price else None,
+        "ghi_W_m2":       ghi,
+        "result":         result,
+        "schedule":       schedule_today,
+        "schedule_tmrw":  schedule_tmrw,
+        "dry_run":        dry_run,
     }
     write_status(status)
 
