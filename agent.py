@@ -473,7 +473,7 @@ def main():
             price_str, ghi, result.get("status")
         )
         # Add cheap hours summary
-        cheap = [s for s in schedule if s["mode"] == "grid_charge"]
+        cheap = [s for s in schedule_today if s["mode"] == "grid_charge"]
         for s in cheap:
             body += "  {:02d}:00 — {:.1f} öre\n".format(
                 s["hour"], s["price_SEK"]*100 if s["price_SEK"] else 0)
