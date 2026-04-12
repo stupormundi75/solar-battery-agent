@@ -131,6 +131,28 @@
     </div>
   </div>
 
+  <!-- Battery SOC row -->
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px;" id="battery-row">
+    <div class="card">
+      <div class="card-label">Battery SOC</div>
+      <div class="card-value" id="soc">—</div>
+      <div class="card-sub" id="soc-sub">% charged</div>
+      <div style="margin-top:12px;background:var(--bg3);border-radius:6px;height:8px;overflow:hidden;">
+        <div id="soc-bar" style="height:100%;width:0%;background:var(--normal);border-radius:6px;transition:width 0.5s;"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-label">Household Load Now</div>
+      <div class="card-value" id="load">—</div>
+      <div class="card-sub">W</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Smart Charging</div>
+      <div id="smart-status" style="font-size:13px;font-weight:700;margin-top:4px;">—</div>
+      <div class="card-sub" id="smart-sub">—</div>
+    </div>
+  </div>
+
   <!-- 48h Schedule -->
   <div class="card grid-full">
     <div class="card-label">48h Schedule</div>
@@ -304,6 +326,45 @@ function render(d) {
   badge.className = 'mode-badge mode-' + d.mode;
   badge.innerHTML = emoji + ' ' + d.mode.replace('_',' ').replace(/\b\w/g,c=>c.toUpperCase());
   document.getElementById('reason').textContent = d.reason;
+
+  // Battery SOC
+  if (d.battery_soc_pct != null) {
+    const soc = d.battery_soc_pct;
+    document.getElementById('soc').textContent = soc.toFixed(1);
+    document.getElementById('soc-bar').style.width = soc + '%';
+    const socColor = soc > 60 ? 'var(--normal)' : soc > 30 ? 'var(--solar)' : 'var(--warn)';
+    document.getElementById('soc-bar').style.background = socColor;
+    document.getElementById('soc').style.color = socColor;
+  }
+  if (d.battery_state) {
+    const load = d.battery_state.load_power_w;
+    if (load != null) document.getElementById('load').textContent = load.toFixed(0);
+  }
+
+  // Smart charging status
+  const smartEl  = document.getElementById('smart-status');
+  const smartSub = document.getElementById('smart-sub');
+  if (d.smart_charging) {
+    const skipped = (d.schedule || []).filter(s => s.smart && s.smart.skipped);
+    const charged = (d.schedule || []).filter(s => s.mode === 'grid_charge');
+    if (skipped.length > 0) {
+      smartEl.textContent  = '✓ Skipped ' + skipped.length + ' cheap hour(s)';
+      smartEl.style.color  = 'var(--normal)';
+      smartSub.textContent = 'Solar will cover — saving grid cost';
+    } else if (charged.length > 0) {
+      smartEl.textContent  = '⚡ Charging ' + charged.length + ' hour(s)';
+      smartEl.style.color  = 'var(--grid)';
+      smartSub.textContent = 'Shortfall detected — grid charge needed';
+    } else {
+      smartEl.textContent  = '· No action needed';
+      smartEl.style.color  = 'var(--muted)';
+      smartSub.textContent = 'Battery sufficient for tonight';
+    }
+  } else {
+    smartEl.textContent  = 'Disabled';
+    smartEl.style.color  = 'var(--muted)';
+    smartSub.textContent = 'Using simple mode';
+  }
 
   const pEl = document.getElementById('price');
   pEl.textContent = d.price_ore != null ? d.price_ore.toFixed(1) : '—';

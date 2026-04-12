@@ -1,14 +1,26 @@
 #!/opt/alt/python311/bin/python3.11
 """
-Solar Battery Agent
-===================
-Runs every hour via cron. Fetches spot prices + solar forecast,
-decides battery mode, sets it via iSolarCloud API, writes status.json.
+Solar Battery Agent — Smart Charging Edition
+=============================================
+Runs every hour via cron. Fetches spot prices + solar forecast + live battery
+state, decides intelligently whether to grid-charge, then sets iSolarCloud.
 
-Cron entry (run as your user):
+Smart charging logic:
+  1. During solar hours (GHI >= threshold) -> Stop (panels charge for free)
+  2. During non-solar hours, check if grid charge is actually needed:
+       a. Fetch current battery SOC from iSolarCloud
+       b. Calculate expected solar yield tomorrow
+       c. Calculate expected household consumption overnight + tomorrow morning
+       d. If solar will cover remaining needs -> skip grid charge
+       e. If shortfall exists -> grid charge during cheapest hours
+  3. Everything else -> Stop (self-consumption)
+
+System specs (update in config.json):
+  battery_capacity_kwh: 10.0
+  panel_capacity_kwp:   6.0
+
+Cron entry:
   2 * * * * /opt/alt/python311/bin/python3.11 /var/www/godaly.com/solar-agent/agent.py
-
-No web server needed. Dashboard reads status.json via static Apache.
 """
 
 import json
@@ -16,12 +28,9 @@ import logging
 import smtplib
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
-
-# Use requests from --user installed packages
-sys.path.insert(0, "/var/www/godaly.com/.local/lib/python3.6/site-packages")
 
 import requests
 
@@ -39,7 +48,41 @@ TOKEN_FILE  = BASE_DIR / "token.json"
 STATUS_FILE = Path("/var/www/godaly.com/battery/status.json")
 LOG_FILE    = BASE_DIR / "logs" / "agent.log"
 LOG_FILE.parent.mkdir(exist_ok=True)
-STATUS_FILE.parent.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Default config
+# ---------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    "latitude":              55.702,
+    "longitude":             13.163,
+    "price_zone":            "SE4",
+    "cheap_hours_per_day":   3,
+    "solar_ghi_threshold":   100,
+    "dry_run":               False,
+    "notify_email":          "",
+    # System specs for smart charging
+    "battery_capacity_kwh":  10.0,
+    "panel_capacity_kwp":    6.0,
+    "panel_efficiency":      0.16,   # 16% — typical for modern panels
+    "avg_consumption_kwh":   10.0,   # daily household consumption estimate
+    "min_soc_pct":           20,     # never charge below this SOC (%)
+    "smart_charging":        True,   # enable smart charging logic
+    "smtp": {
+        "host": "", "port": 587,
+        "username": "", "password": "", "from": ""
+    },
+    "isolarcloud": {
+        "app_key":      "",
+        "app_secret":   "",
+        "app_id":       "3251",
+        "plant_id":     "5486815",
+        "device_uuid":  "4033562",
+        "ps_id":        "5486815",
+        "redirect_uri": "https://battery.godaly.com/auth/callback",
+    }
+}
+
+ISOLARCLOUD_BASE = "https://gateway.isolarcloud.eu"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -55,35 +98,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config
+# Config helpers
 # ---------------------------------------------------------------------------
-DEFAULT_CONFIG = {
-    "latitude":            55.702,
-    "longitude":           13.163,
-    "price_zone":          "SE4",
-    "cheap_hours_per_day": 3,
-    "solar_ghi_threshold": 100,
-    "dry_run":             False,
-    "notify_email":        "",
-    "smtp": {
-        "host":     "mail.godaly.com",
-        "port":     587,
-        "username": "",
-        "password": "",
-        "from":     ""
-    },
-    "isolarcloud": {
-        "app_key":      "",
-        "app_secret":   "",
-        "app_id":       "3251",
-        "plant_id":     "5486815",
-        "device_uuid":  "4033562",
-        "redirect_uri": "https://battery.godaly.com/auth/callback",
-    }
-}
-
-ISOLARCLOUD_BASE = "https://gateway.isolarcloud.eu"
-
 
 def load_config():
     if CONFIG_FILE.exists():
@@ -92,19 +108,21 @@ def load_config():
         merged = {}
         merged.update(DEFAULT_CONFIG)
         merged.update(saved)
-        iso = {}
-        iso.update(DEFAULT_CONFIG["isolarcloud"])
-        iso.update(saved.get("isolarcloud", {}))
-        merged["isolarcloud"] = iso
-        smtp = {}
-        smtp.update(DEFAULT_CONFIG["smtp"])
-        smtp.update(saved.get("smtp", {}))
-        merged["smtp"] = smtp
+        for sub in ("isolarcloud", "smtp"):
+            d = {}
+            d.update(DEFAULT_CONFIG[sub])
+            d.update(saved.get(sub, {}))
+            merged[sub] = d
         return merged
     return dict(DEFAULT_CONFIG)
 
+
+def save_config(cfg):
+    with open(str(CONFIG_FILE), "w") as f:
+        json.dump(cfg, f, indent=2)
+
 # ---------------------------------------------------------------------------
-# Token
+# Token helpers
 # ---------------------------------------------------------------------------
 
 def load_token():
@@ -119,7 +137,7 @@ def save_token(token):
         json.dump(token, f, indent=2)
 
 # ---------------------------------------------------------------------------
-# iSolarCloud
+# iSolarCloud HTTP helpers
 # ---------------------------------------------------------------------------
 
 def isolar_headers(app_secret, access_token=None):
@@ -150,13 +168,13 @@ def isolar_post(path, data, iso_cfg, access_token=None):
 def get_valid_token(iso_cfg):
     token = load_token()
     if not token:
-        log.error("No token.json — run authorization first")
+        log.error("No token.json found")
         return None
 
     expires_at = token.get("expires_at", 0)
     now        = int(datetime.now(timezone.utc).timestamp())
 
-    if expires_at - now < 60:
+    if expires_at - now < 3600:   # refresh if less than 1h remaining
         log.info("Token expiring — refreshing...")
         try:
             data = isolar_post(
@@ -168,7 +186,7 @@ def get_valid_token(iso_cfg):
                 token.update(data)
                 token["expires_at"] = now + int(data.get("expires_in", 172799)) - 20
                 save_token(token)
-                log.info("Token refreshed")
+                log.info("Token refreshed successfully")
             else:
                 log.error("Token refresh failed: {}".format(data))
                 return None
@@ -178,19 +196,174 @@ def get_valid_token(iso_cfg):
 
     return token.get("access_token")
 
+# ---------------------------------------------------------------------------
+# Live battery data from iSolarCloud
+# ---------------------------------------------------------------------------
+
+def fetch_battery_state(iso_cfg):
+    """
+    Fetch current battery SOC and today's energy data from iSolarCloud.
+    Returns dict with:
+      soc_pct         — battery state of charge (0-100)
+      load_power_w    — current household consumption in watts
+      charged_today_wh  — energy charged into battery today
+      discharged_today_wh — energy discharged from battery today
+      grid_bought_wh  — grid energy purchased today
+      load_today_wh   — total household consumption today
+    """
+    access_token = get_valid_token(iso_cfg)
+    if not access_token:
+        log.warning("No token — skipping live battery fetch")
+        return None
+
+    try:
+        result = isolar_post(
+            "/openapi/platform/getPowerStationRealTimeData",
+            {
+                "ps_id_list":        [int(iso_cfg["ps_id"])],
+                "point_id_list":     [
+                    "83252",   # battery SOC
+                    "83106",   # load power now (W)
+                    "83322",   # battery charged today (Wh)
+                    "83323",   # battery discharged today (Wh)
+                    "83102",   # grid purchased today (Wh)
+                    "83118",   # daily load consumption (Wh)
+                ],
+                "is_get_point_dict": "1",
+            },
+            iso_cfg,
+            access_token,
+        )
+
+        if result.get("result_code") != "1":
+            log.error("Battery state fetch failed: {}".format(result))
+            return None
+
+        device = result["result_data"]["device_point_list"][0]
+
+        def val(key, default=None):
+            v = device.get(key)
+            if v is None:
+                return default
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return default
+
+        state = {
+            "soc_pct":              val("p83252", 50.0) * 100
+                                    if val("p83252", 0) <= 1.0
+                                    else val("p83252", 50.0),
+            "load_power_w":         val("p83106", 0),
+            "charged_today_wh":     val("p83322", 0),
+            "discharged_today_wh":  val("p83323", 0),
+            "grid_bought_wh":       val("p83102", 0),
+            "load_today_wh":        val("p83118", 0),
+        }
+        log.info("Battery state: SOC={:.1f}%, load={:.0f}W, "
+                 "charged={:.0f}Wh, bought={:.0f}Wh".format(
+            state["soc_pct"], state["load_power_w"],
+            state["charged_today_wh"], state["grid_bought_wh"]))
+        return state
+
+    except Exception as e:
+        log.error("fetch_battery_state failed: {}".format(e))
+        return None
+
+# ---------------------------------------------------------------------------
+# Smart charging decision
+# ---------------------------------------------------------------------------
+
+def should_grid_charge(cfg, current_hour, battery_state, solar_tomorrow):
+    """
+    Decide whether grid charging is actually needed this hour.
+
+    Logic:
+      1. Calculate energy remaining in battery right now
+      2. Calculate expected household consumption until tomorrow morning
+         (when solar kicks in)
+      3. Calculate expected solar yield tomorrow
+      4. If (battery + solar_tomorrow) >= consumption_needed -> skip charge
+      5. If shortfall -> charge needed
+
+    Returns (should_charge: bool, reason: str, details: dict)
+    """
+    if not cfg.get("smart_charging", True):
+        return True, "Smart charging disabled — using simple mode", {}
+
+    if battery_state is None:
+        return True, "Could not fetch battery state — defaulting to charge", {}
+
+    battery_kwh    = cfg["battery_capacity_kwh"]
+    panel_kwp      = cfg["panel_capacity_kwp"]
+    efficiency     = cfg["panel_efficiency"]
+    min_soc        = cfg["min_soc_pct"]
+    avg_daily_kwh  = cfg["avg_consumption_kwh"]
+
+    # Current stored energy (usable above min_soc)
+    soc_pct        = battery_state["soc_pct"]
+    usable_kwh     = battery_kwh * max(0, (soc_pct - min_soc) / 100.0)
+
+    # Hours until solar starts (assume solar from 07:00)
+    solar_start_hour = 7
+    if current_hour >= solar_start_hour:
+        hours_until_solar = (24 - current_hour) + solar_start_hour
+    else:
+        hours_until_solar = solar_start_hour - current_hour
+
+    # Expected consumption until solar starts
+    hourly_consumption_kwh  = avg_daily_kwh / 24.0
+    consumption_until_solar = hourly_consumption_kwh * hours_until_solar
+
+    # Expected solar yield tomorrow (kWh)
+    # GHI in W/m², panel area = capacity / (1000 * efficiency)
+    total_ghi_tomorrow = sum(s["ghi"] for s in solar_tomorrow)  # W/m² summed over hours
+    # Convert: kWh = sum(GHI_W_m2) * panel_kwp * efficiency / 1000
+    solar_yield_kwh = total_ghi_tomorrow * panel_kwp * efficiency / 1000.0
+
+    # Can we cover consumption_until_solar with battery + morning solar?
+    morning_solar_kwh = solar_yield_kwh * 0.3   # roughly 30% of daily solar is morning
+    covered_kwh       = usable_kwh + morning_solar_kwh
+    shortfall_kwh     = max(0, consumption_until_solar - covered_kwh)
+
+    details = {
+        "soc_pct":               round(soc_pct, 1),
+        "usable_kwh":            round(usable_kwh, 2),
+        "hours_until_solar":     hours_until_solar,
+        "consumption_until_solar_kwh": round(consumption_until_solar, 2),
+        "solar_yield_tomorrow_kwh":    round(solar_yield_kwh, 2),
+        "morning_solar_kwh":     round(morning_solar_kwh, 2),
+        "shortfall_kwh":         round(shortfall_kwh, 2),
+    }
+
+    if shortfall_kwh <= 0:
+        reason = (
+            "Smart: battery {:.0f}% ({:.1f}kWh usable) + "
+            "tomorrow solar ({:.1f}kWh) covers {:.1f}h consumption "
+            "— skipping grid charge".format(
+                soc_pct, usable_kwh, solar_yield_kwh, hours_until_solar)
+        )
+        return False, reason, details
+    else:
+        reason = (
+            "Smart: shortfall {:.1f}kWh "
+            "(battery {:.0f}%, solar {:.1f}kWh, need {:.1f}kWh) "
+            "— grid charging".format(
+                shortfall_kwh, soc_pct, solar_yield_kwh,
+                consumption_until_solar)
+        )
+        return True, reason, details
+
+# ---------------------------------------------------------------------------
+# Battery control
+# ---------------------------------------------------------------------------
 
 def set_battery_command(iso_cfg, command, dry_run=False):
-    """
-    command: 'Charge' | 'Stop'
-    param_code 10004 = charge_discharge_command
-    Charge=170, Stop=204
-    """
     if dry_run:
         log.info("DRY RUN — would set battery to: {}".format(command))
         return {"status": "dry_run", "command": command}
 
     if not iso_cfg.get("app_key") or not iso_cfg.get("app_secret"):
-        log.error("iSolarCloud credentials not configured")
         return {"status": "error", "msg": "not configured"}
 
     access_token = get_valid_token(iso_cfg)
@@ -247,12 +420,10 @@ def fetch_spot_prices(zone, date):
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
-
         hour_prices = defaultdict(list)
         for item in data:
             h = datetime.fromisoformat(item["time_start"]).hour
             hour_prices[h].append(item["SEK_per_kWh"])
-
         return [
             {"hour": h, "SEK_per_kWh": round(sum(v)/len(v), 4)}
             for h, v in sorted(hour_prices.items())
@@ -264,9 +435,8 @@ def fetch_spot_prices(zone, date):
 
 def fetch_solar_forecast(lat, lon, date):
     """Fetch 48h solar forecast (today + tomorrow)."""
-    from datetime import timedelta
-    date_str      = date.strftime("%Y-%m-%d")
-    tomorrow_str  = (date + timedelta(days=1)).strftime("%Y-%m-%d")
+    date_str     = date.strftime("%Y-%m-%d")
+    tomorrow_str = (date + timedelta(days=1)).strftime("%Y-%m-%d")
     url = (
         "https://api.open-meteo.com/v1/forecast"
         "?latitude={}&longitude={}"
@@ -294,11 +464,16 @@ def fetch_solar_forecast(lat, lon, date):
         return []
 
 # ---------------------------------------------------------------------------
-# Decision logic
+# Schedule computation
 # ---------------------------------------------------------------------------
 
-def compute_schedule_for_day(cfg, prices, solar_slots):
-    """Compute 24-slot schedule for a single day."""
+def compute_schedule_for_day(cfg, prices, solar_slots,
+                              battery_state=None, solar_tomorrow=None,
+                              current_hour=None):
+    """
+    Compute 24-slot schedule for a single day.
+    If battery_state and solar_tomorrow provided, uses smart charging logic.
+    """
     threshold = cfg["solar_ghi_threshold"]
     n_cheap   = cfg["cheap_hours_per_day"]
 
@@ -313,6 +488,24 @@ def compute_schedule_for_day(cfg, prices, solar_slots):
     cheap_hours = {h for h, _ in non_solar_prices[:n_cheap]}
     cheap_rank  = {h: i+1 for i, (h, _) in enumerate(non_solar_prices)}
 
+    # Smart charging check — only for future cheap hours
+    smart_details  = {}
+    smart_skip_hrs = set()
+    if battery_state is not None and solar_tomorrow is not None:
+        for h in list(cheap_hours):
+            if current_hour is not None and h <= current_hour:
+                continue   # already past
+            charge, reason, details = should_grid_charge(
+                cfg, h, battery_state, solar_tomorrow)
+            if not charge:
+                smart_skip_hrs.add(h)
+                smart_details[h] = {"skipped": True, "reason": reason,
+                                    "details": details}
+                log.info("Hour {}: smart skip — {}".format(h, reason))
+            else:
+                smart_details[h] = {"skipped": False, "reason": reason,
+                                    "details": details}
+
     slots = []
     for hour in range(24):
         price = price_by_hour.get(hour)
@@ -320,49 +513,48 @@ def compute_schedule_for_day(cfg, prices, solar_slots):
 
         if hour in solar_hours:
             mode   = "solar"
-            reason = "Solar generating ({:.0f} W/m2 >= {})".format(ghi, threshold)
-        elif hour in cheap_hours:
+            reason = "Solar generating ({:.0f} W/m2 >= {})".format(
+                ghi, threshold)
+        elif hour in cheap_hours and hour not in smart_skip_hrs:
             mode   = "grid_charge"
             reason = "Cheapest non-solar hour (rank #{})".format(
                 cheap_rank.get(hour, "?"))
+        elif hour in smart_skip_hrs:
+            mode   = "normal"
+            d      = smart_details.get(hour, {})
+            reason = d.get("reason", "Smart: solar sufficient — skipping charge")
         else:
             mode   = "normal"
             reason = "Self-consumption"
 
-        slots.append({
+        slot = {
             "hour":      hour,
             "price_SEK": round(price, 4) if price is not None else None,
             "ghi_W_m2":  ghi,
             "mode":      mode,
             "reason":    reason,
-        })
+        }
+        if hour in smart_details:
+            slot["smart"] = smart_details[hour]
+        slots.append(slot)
+
     return slots
 
-
-def compute_schedule(cfg, prices, solar):
-    """Compute today schedule (used for battery control)."""
-    today = solar[0]["date"] if solar and "date" in solar[0] else None
-    today_solar = [s for s in solar if s.get("date") == today] if today else solar
-    return compute_schedule_for_day(cfg, prices, today_solar)
-
 # ---------------------------------------------------------------------------
-# Email notification
+# Email
 # ---------------------------------------------------------------------------
 
 def send_email(cfg, subject, body):
     smtp = cfg.get("smtp", {})
     to   = cfg.get("notify_email", "")
-
     if not to or not smtp.get("host"):
-        log.info("Email not configured — skipping notification")
+        log.info("Email not configured — skipping")
         return
-
     try:
         msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = subject
         msg["From"]    = smtp.get("from", smtp.get("username", ""))
         msg["To"]      = to
-
         with smtplib.SMTP(smtp["host"], int(smtp.get("port", 587))) as s:
             s.starttls()
             if smtp.get("username") and smtp.get("password"):
@@ -373,7 +565,7 @@ def send_email(cfg, subject, body):
         log.error("Email failed: {}".format(e))
 
 # ---------------------------------------------------------------------------
-# Write status.json for dashboard
+# Write status.json
 # ---------------------------------------------------------------------------
 
 def write_status(status):
@@ -390,13 +582,13 @@ def main():
     tz           = ZoneInfo("Europe/Stockholm")
     now          = datetime.now(tz)
     current_hour = now.hour
+    tomorrow     = now + timedelta(days=1)
+    today_str    = now.strftime("%Y-%m-%d")
+    tomorrow_str = tomorrow.strftime("%Y-%m-%d")
 
     log.info("Agent tick — {}".format(now.strftime("%Y-%m-%d %H:%M")))
 
-    from datetime import timedelta
-
-    # 1. Fetch today's data
-    tomorrow     = now + timedelta(days=1)
+    # 1. Fetch prices and solar forecast
     prices_today = fetch_spot_prices(cfg["price_zone"], now)
     prices_tmrw  = fetch_spot_prices(cfg["price_zone"], tomorrow)
     solar_48h    = fetch_solar_forecast(cfg["latitude"], cfg["longitude"], now)
@@ -405,18 +597,26 @@ def main():
         log.error("No price data — aborting")
         return
 
-    # Split solar into today/tomorrow
-    today_str    = now.strftime("%Y-%m-%d")
-    tomorrow_str = tomorrow.strftime("%Y-%m-%d")
-    solar_today  = [s for s in solar_48h if s.get("date") == today_str]
-    solar_tmrw   = [s for s in solar_48h if s.get("date") == tomorrow_str]
+    solar_today = [s for s in solar_48h if s.get("date") == today_str]
+    solar_tmrw  = [s for s in solar_48h if s.get("date") == tomorrow_str]
 
-    # 2. Compute schedules
-    schedule_today = compute_schedule_for_day(cfg, prices_today, solar_today)
-    schedule_tmrw  = compute_schedule_for_day(cfg, prices_tmrw,  solar_tmrw) if prices_tmrw else []
+    # 2. Fetch live battery state (for smart charging)
+    battery_state = None
+    if cfg.get("smart_charging", True) and not cfg.get("dry_run", False):
+        battery_state = fetch_battery_state(cfg["isolarcloud"])
 
+    # 3. Compute schedules
+    schedule_today = compute_schedule_for_day(
+        cfg, prices_today, solar_today,
+        battery_state=battery_state,
+        solar_tomorrow=solar_tmrw,
+        current_hour=current_hour,
+    )
+    schedule_tmrw = compute_schedule_for_day(
+        cfg, prices_tmrw, solar_tmrw) if prices_tmrw else []
+
+    # 4. Find current slot
     slot = next((s for s in schedule_today if s["hour"] == current_hour), None)
-
     if not slot:
         log.error("No schedule slot for hour {}".format(current_hour))
         return
@@ -429,61 +629,77 @@ def main():
     log.info("Hour {}: {} -> {} | {}".format(
         current_hour, mode, command, slot["reason"]))
 
-    # 3. Set battery
+    # 5. Set battery
     dry_run = cfg.get("dry_run", False)
     result  = set_battery_command(cfg["isolarcloud"], command, dry_run=dry_run)
 
-    # 4. Write status.json (includes both days for dashboard)
+    # 6. Write status.json
+    soc_pct = battery_state["soc_pct"] if battery_state else None
     status = {
-        "last_run":       now.isoformat(),
-        "current_hour":   current_hour,
-        "today":          today_str,
-        "tomorrow":       tomorrow_str,
-        "mode":           mode,
-        "command":        command,
-        "reason":         slot["reason"],
-        "price_SEK":      price,
-        "price_ore":      round(price * 100, 1) if price else None,
-        "ghi_W_m2":       ghi,
-        "result":         result,
-        "schedule":       schedule_today,
-        "schedule_tmrw":  schedule_tmrw,
-        "dry_run":        dry_run,
+        "last_run":          now.isoformat(),
+        "current_hour":      current_hour,
+        "today":             today_str,
+        "tomorrow":          tomorrow_str,
+        "mode":              mode,
+        "command":           command,
+        "reason":            slot["reason"],
+        "price_SEK":         price,
+        "price_ore":         round(price * 100, 1) if price else None,
+        "ghi_W_m2":          ghi,
+        "battery_soc_pct":   soc_pct,
+        "battery_state":     battery_state,
+        "result":            result,
+        "schedule":          schedule_today,
+        "schedule_tmrw":     schedule_tmrw,
+        "dry_run":           dry_run,
+        "smart_charging":    cfg.get("smart_charging", True),
     }
     write_status(status)
 
-    # 5. Send email notification
+    # 7. Email notification
     if result.get("status") in ("ok", "dry_run"):
-        price_str = "{:.1f} öre/kWh".format(price*100) if price else "unknown"
-        subject = "Battery Agent: {} at {:02d}:00 ({})".format(
+        price_str = "{:.1f} ore/kWh".format(price*100) if price else "unknown"
+        soc_str   = "{:.1f}%".format(soc_pct) if soc_pct else "unknown"
+        subject   = "Battery Agent: {} at {:02d}:00 ({})".format(
             command, current_hour, price_str)
         body = (
             "Solar Battery Agent Report\n"
             "==========================\n"
-            "Time:     {:02d}:00\n"
-            "Mode:     {}\n"
-            "Command:  {}\n"
-            "Reason:   {}\n"
-            "Price:    {}\n"
-            "Solar GHI:{} W/m2\n"
-            "Status:   {}\n"
-            "\nToday's cheapest hours:\n"
+            "Time:        {:02d}:00\n"
+            "Mode:        {}\n"
+            "Command:     {}\n"
+            "Reason:      {}\n"
+            "Price:       {}\n"
+            "Solar GHI:   {} W/m2\n"
+            "Battery SOC: {}\n"
+            "Status:      {}\n"
         ).format(
             current_hour, mode, command, slot["reason"],
-            price_str, ghi, result.get("status")
+            price_str, ghi, soc_str, result.get("status")
         )
-        # Add cheap hours summary
-        cheap = [s for s in schedule_today if s["mode"] == "grid_charge"]
-        for s in cheap:
-            body += "  {:02d}:00 — {:.1f} öre\n".format(
-                s["hour"], s["price_SEK"]*100 if s["price_SEK"] else 0)
+
+        # Smart charging summary
+        if battery_state and cfg.get("smart_charging"):
+            skipped = [s for s in schedule_today
+                       if s.get("smart", {}).get("skipped")]
+            charged = [s for s in schedule_today if s["mode"] == "grid_charge"]
+            if skipped:
+                body += "\nSmart charging SKIPPED {} hour(s) (solar sufficient):\n".format(
+                    len(skipped))
+                for s in skipped:
+                    body += "  {:02d}:00\n".format(s["hour"])
+            if charged:
+                body += "\nGrid charging {} hour(s):\n".format(len(charged))
+                for s in charged:
+                    body += "  {:02d}:00 — {:.1f} ore\n".format(
+                        s["hour"], s["price_SEK"]*100 if s["price_SEK"] else 0)
 
         send_email(cfg, subject, body)
     else:
         send_email(
             cfg,
             "Battery Agent ERROR at {:02d}:00".format(current_hour),
-            "Error: {}\nCheck logs at ~/solar-agent/logs/agent.log".format(
+            "Error: {}\nCheck: ~/solar-agent/logs/agent.log".format(
                 result.get("msg"))
         )
 
