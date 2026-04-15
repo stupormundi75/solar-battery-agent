@@ -355,13 +355,54 @@ def should_grid_charge(cfg, current_hour, battery_state, solar_tomorrow):
         return True, reason, details
 
 # ---------------------------------------------------------------------------
-# Battery control
+# Battery control — forced charging time windows
 # ---------------------------------------------------------------------------
 
-def set_battery_command(iso_cfg, command, dry_run=False):
+def _isolar_set_params(iso_cfg, access_token, param_list, task_name):
+    """Send a paramSetting call with multiple params at once."""
+    result = isolar_post(
+        "/openapi/platform/paramSetting",
+        {
+            "set_type":      0,
+            "uuid":          str(iso_cfg["device_uuid"]),
+            "task_name":     task_name,
+            "expire_second": 300,
+            "param_list":    param_list,
+        },
+        iso_cfg,
+        access_token,
+    )
+    success = (
+        result.get("result_code") == "1"
+        and result.get("result_data", {}).get("check_result") == "1"
+        and result.get("result_data", {}).get(
+            "dev_result_list", [{}])[0].get("code") == "1"
+    )
+    return success, result
+
+
+def set_forced_charging_windows(iso_cfg, windows, dry_run=False):
+    """
+    Set forced charging time windows on the inverter.
+
+    windows: list of 0, 1 or 2 dicts:
+      [{"start_h": 2, "start_m": 0, "end_h": 5, "end_m": 0, "target_soc": 90}, ...]
+
+    Uses params:
+      10065 = forced_charging enable (1=on, 0=off)
+      10067/68/69/70/71 = window 1 start_h/start_m/end_h/end_m/target_soc
+      10072/73/74/75/76 = window 2 start_h/start_m/end_h/end_m/target_soc
+    """
     if dry_run:
-        log.info("DRY RUN — would set battery to: {}".format(command))
-        return {"status": "dry_run", "command": command}
+        if windows:
+            for i, w in enumerate(windows):
+                log.info("DRY RUN — would set charging window {}: "
+                         "{:02d}:{:02d}–{:02d}:{:02d} target {}%".format(
+                    i+1, w["start_h"], w["start_m"],
+                    w["end_h"], w["end_m"], w["target_soc"]))
+        else:
+            log.info("DRY RUN — would disable forced charging windows")
+        return {"status": "dry_run", "windows": windows}
 
     if not iso_cfg.get("app_key") or not iso_cfg.get("app_secret"):
         return {"status": "error", "msg": "not configured"}
@@ -370,41 +411,140 @@ def set_battery_command(iso_cfg, command, dry_run=False):
     if not access_token:
         return {"status": "error", "msg": "no valid token"}
 
-    value_map = {"Charge": "170", "Stop": "204", "Discharge": "187"}
-    set_value  = value_map.get(command, "204")
-
     try:
-        result = isolar_post(
-            "/openapi/platform/paramSetting",
-            {
-                "set_type":      0,
-                "uuid":          str(iso_cfg["device_uuid"]),
-                "task_name":     "BatteryAgent {}".format(
-                    datetime.now().strftime("%Y-%m-%d %H:%M")),
-                "expire_second": 120,
-                "param_list":    [{"param_code": "10004", "set_value": set_value}],
-            },
-            iso_cfg,
-            access_token,
-        )
+        # Build param list
+        params = []
 
-        success = (
-            result.get("result_code") == "1"
-            and result.get("result_data", {}).get("check_result") == "1"
-            and result.get("result_data", {}).get(
-                "dev_result_list", [{}])[0].get("code") == "1"
-        )
+        if not windows:
+            # Disable forced charging
+            params.append({"param_code": "10065", "set_value": "0"})
+        else:
+            # Enable forced charging
+            params.append({"param_code": "10065", "set_value": "1"})
+
+            # Window 1 (always set)
+            w1 = windows[0]
+            params += [
+                {"param_code": "10067", "set_value": str(w1["start_h"])},
+                {"param_code": "10068", "set_value": str(w1["start_m"])},
+                {"param_code": "10069", "set_value": str(w1["end_h"])},
+                {"param_code": "10070", "set_value": str(w1["end_m"])},
+                {"param_code": "10071", "set_value": str(w1["target_soc"])},
+            ]
+
+            # Window 2 (if provided)
+            if len(windows) >= 2:
+                w2 = windows[1]
+                params += [
+                    {"param_code": "10072", "set_value": str(w2["start_h"])},
+                    {"param_code": "10073", "set_value": str(w2["start_m"])},
+                    {"param_code": "10074", "set_value": str(w2["end_h"])},
+                    {"param_code": "10075", "set_value": str(w2["end_m"])},
+                    {"param_code": "10076", "set_value": str(w2["target_soc"])},
+                ]
+
+        task_name = "BatteryAgent {}".format(
+            datetime.now().strftime("%Y-%m-%d %H:%M"))
+        success, result = _isolar_set_params(
+            iso_cfg, access_token, params, task_name)
 
         if success:
-            log.info("Battery set to {} OK".format(command))
-            return {"status": "ok", "command": command}
+            if windows:
+                for i, w in enumerate(windows):
+                    log.info("Charging window {} set: {:02d}:{:02d}–{:02d}:{:02d} "
+                             "target {}%".format(
+                        i+1, w["start_h"], w["start_m"],
+                        w["end_h"], w["end_m"], w["target_soc"]))
+            else:
+                log.info("Forced charging disabled OK")
+            return {"status": "ok", "windows": windows}
         else:
-            log.error("Battery command failed: {}".format(result))
+            log.error("Failed to set charging windows: {}".format(result))
             return {"status": "error", "msg": str(result)}
 
     except Exception as e:
-        log.error("set_battery_command failed: {}".format(e))
+        log.error("set_forced_charging_windows failed: {}".format(e))
         return {"status": "error", "msg": str(e)}
+
+
+def compute_charging_windows(cfg, schedule_today, battery_state, solar_tmrw):
+    """
+    Given today's schedule, compute up to 2 forced charging windows.
+
+    Groups consecutive cheap hours into windows, picks the 2 best blocks,
+    calculates target SOC based on smart charging math.
+
+    Returns list of 0-2 window dicts.
+    """
+    cheap_hours = sorted(
+        [s["hour"] for s in schedule_today if s["mode"] == "grid_charge"])
+
+    if not cheap_hours:
+        return []
+
+    # Group consecutive hours into blocks
+    blocks = []
+    block  = [cheap_hours[0]]
+    for h in cheap_hours[1:]:
+        if h == block[-1] + 1:
+            block.append(h)
+        else:
+            blocks.append(block)
+            block = [h]
+    blocks.append(block)
+
+    # Sort blocks by average price (cheapest first)
+    def avg_price(block):
+        prices = [s["price_SEK"] or 999
+                  for s in schedule_today if s["hour"] in block]
+        return sum(prices) / len(prices) if prices else 999
+
+    blocks.sort(key=avg_price)
+
+    # Calculate target SOC
+    battery_kwh   = cfg["battery_capacity_kwh"]
+    panel_kwp     = cfg["panel_capacity_kwp"]
+    efficiency    = cfg["panel_efficiency"]
+    min_soc       = cfg["min_soc_pct"]
+    avg_daily_kwh = cfg["avg_consumption_kwh"]
+    soc_pct       = battery_state["soc_pct"] if battery_state else 50.0
+
+    total_ghi_tmrw  = sum(s["ghi"] for s in solar_tmrw)
+    solar_yield_kwh = total_ghi_tmrw * panel_kwp * efficiency / 1000.0
+    hourly_kwh      = avg_daily_kwh / 24.0
+    # Assume we're setting windows for overnight — estimate hours until solar
+    hours_until_solar  = 8   # conservative: assume 8h until panels kick in
+    consumption_needed = hourly_kwh * hours_until_solar
+    morning_solar      = solar_yield_kwh * 0.3
+
+    shortfall_kwh = max(0, consumption_needed - morning_solar)
+    current_stored = battery_kwh * max(0, (soc_pct - min_soc) / 100.0)
+    charge_needed_kwh = max(0, shortfall_kwh - current_stored)
+
+    # Target SOC = current + what we need to charge, capped at 100%
+    charge_needed_pct = (charge_needed_kwh / battery_kwh) * 100
+    target_soc = min(100, int(soc_pct + charge_needed_pct + 10))  # +10 buffer
+    target_soc = max(target_soc, min_soc + 20)  # always at least min_soc+20
+
+    log.info("Charging windows: shortfall={:.1f}kWh, target_soc={}%".format(
+        shortfall_kwh, target_soc))
+
+    # Build up to 2 windows from the 2 cheapest blocks
+    windows = []
+    for block in blocks[:2]:
+        start_h = block[0]
+        end_h   = block[-1] + 1   # end hour is exclusive
+        if end_h >= 24:
+            end_h = 23
+        windows.append({
+            "start_h":   start_h,
+            "start_m":   0,
+            "end_h":     end_h,
+            "end_m":     0,
+            "target_soc": target_soc,
+        })
+
+    return windows
 
 # ---------------------------------------------------------------------------
 # Data fetching
@@ -621,17 +761,18 @@ def main():
         log.error("No schedule slot for hour {}".format(current_hour))
         return
 
-    mode    = slot["mode"]
-    command = "Charge" if mode == "grid_charge" else "Stop"
-    price   = slot["price_SEK"]
-    ghi     = slot["ghi_W_m2"]
+    mode  = slot["mode"]
+    price = slot["price_SEK"]
+    ghi   = slot["ghi_W_m2"]
 
-    log.info("Hour {}: {} -> {} | {}".format(
-        current_hour, mode, command, slot["reason"]))
+    log.info("Hour {}: {} | {}".format(current_hour, mode, slot["reason"]))
 
-    # 5. Set battery
+    # 5. Compute and set forced charging windows (once per run)
     dry_run = cfg.get("dry_run", False)
-    result  = set_battery_command(cfg["isolarcloud"], command, dry_run=dry_run)
+    windows = compute_charging_windows(
+        cfg, schedule_today, battery_state, solar_tmrw)
+    result  = set_forced_charging_windows(
+        cfg["isolarcloud"], windows, dry_run=dry_run)
 
     # 6. Write status.json
     soc_pct = battery_state["soc_pct"] if battery_state else None
@@ -641,7 +782,7 @@ def main():
         "today":             today_str,
         "tomorrow":          tomorrow_str,
         "mode":              mode,
-        "command":           command,
+        "windows":           windows,
         "reason":            slot["reason"],
         "price_SEK":         price,
         "price_ore":         round(price * 100, 1) if price else None,
@@ -658,41 +799,33 @@ def main():
 
     # 7. Email notification
     if result.get("status") in ("ok", "dry_run"):
-        price_str = "{:.1f} ore/kWh".format(price*100) if price else "unknown"
-        soc_str   = "{:.1f}%".format(soc_pct) if soc_pct else "unknown"
-        subject   = "Battery Agent: {} at {:02d}:00 ({})".format(
-            command, current_hour, price_str)
+        soc_str = "{:.1f}%".format(soc_pct) if soc_pct else "unknown"
+        subject = "Battery Agent: {:02d}:00 — {} | SOC {}".format(
+            current_hour, mode, soc_str)
         body = (
             "Solar Battery Agent Report\n"
             "==========================\n"
             "Time:        {:02d}:00\n"
             "Mode:        {}\n"
-            "Command:     {}\n"
             "Reason:      {}\n"
-            "Price:       {}\n"
-            "Solar GHI:   {} W/m2\n"
             "Battery SOC: {}\n"
+            "Solar GHI:   {} W/m2\n"
             "Status:      {}\n"
-        ).format(
-            current_hour, mode, command, slot["reason"],
-            price_str, ghi, soc_str, result.get("status")
-        )
+        ).format(current_hour, mode, slot["reason"],
+                 soc_str, ghi, result.get("status"))
 
-        # Smart charging summary
-        if battery_state and cfg.get("smart_charging"):
-            skipped = [s for s in schedule_today
-                       if s.get("smart", {}).get("skipped")]
-            charged = [s for s in schedule_today if s["mode"] == "grid_charge"]
-            if skipped:
-                body += "\nSmart charging SKIPPED {} hour(s) (solar sufficient):\n".format(
-                    len(skipped))
-                for s in skipped:
-                    body += "  {:02d}:00\n".format(s["hour"])
-            if charged:
-                body += "\nGrid charging {} hour(s):\n".format(len(charged))
-                for s in charged:
-                    body += "  {:02d}:00 — {:.1f} ore\n".format(
-                        s["hour"], s["price_SEK"]*100 if s["price_SEK"] else 0)
+        if windows:
+            body += "\nForced charging windows set:\n"
+            for i, w in enumerate(windows):
+                body += "  Window {}: {:02d}:00-{:02d}:00 target {}%\n".format(
+                    i+1, w["start_h"], w["end_h"], w["target_soc"])
+        else:
+            body += "\nNo grid charging needed tonight.\n"
+
+        skipped = [s for s in schedule_today if s.get("smart", {}).get("skipped")]
+        if skipped:
+            body += "\nSmart: skipped {} cheap hour(s) — solar sufficient\n".format(
+                len(skipped))
 
         send_email(cfg, subject, body)
     else:
