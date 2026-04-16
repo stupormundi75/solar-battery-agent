@@ -537,11 +537,12 @@ def compute_charging_windows(cfg, schedule_today, battery_state, solar_tmrw):
         if end_h >= 24:
             end_h = 23
         windows.append({
-            "start_h":   start_h,
-            "start_m":   0,
-            "end_h":     end_h,
-            "end_m":     0,
+            "start_h":    start_h,
+            "start_m":    0,
+            "end_h":      end_h,
+            "end_m":      0,
             "target_soc": target_soc,
+            "is_tomorrow": start_h < 12,  # early morning hours are next calendar day
         })
 
     return windows

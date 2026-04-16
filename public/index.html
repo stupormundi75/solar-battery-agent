@@ -386,8 +386,12 @@ function render(d) {
   if (d.windows && d.windows.length > 0) {
     winCard.style.display = 'block';
     winContent.innerHTML = d.windows.map((w, i) => {
+      const dayLabel = w.is_tomorrow
+        ? '<span style="color:var(--accent)">tomorrow</span>'
+        : '<span style="color:var(--muted)">tonight</span>';
       return '<div style="margin-bottom:6px;">' +
         '<span style="color:var(--grid)">⚡ Window ' + (i+1) + ':</span> ' +
+        dayLabel + ' ' +
         String(w.start_h).padStart(2,'0') + ':00 → ' +
         String(w.end_h).padStart(2,'0') + ':00 ' +
         '<span style="color:var(--muted)">target ' + w.target_soc + '% SOC</span>' +
@@ -412,11 +416,18 @@ function render(d) {
     }
   }
 
-  // Mark hours that fall inside charging windows
+  // Mark hours that fall inside charging windows (on correct day)
   if (d.windows && d.windows.length > 0) {
+    // Today windows (is_tomorrow=false, hours >= 12)
     st.forEach(slot => {
       slot.in_window = d.windows.some(w =>
-        slot.hour >= w.start_h && slot.hour < w.end_h);
+        !w.is_tomorrow && slot.hour >= w.start_h && slot.hour < w.end_h);
+      if (slot.in_window && slot.mode === 'normal') slot.mode = 'grid_charge';
+    });
+    // Tomorrow windows (is_tomorrow=true, hours < 12)
+    sm.forEach(slot => {
+      slot.in_window = d.windows.some(w =>
+        w.is_tomorrow && slot.hour >= w.start_h && slot.hour < w.end_h);
       if (slot.in_window && slot.mode === 'normal') slot.mode = 'grid_charge';
     });
   }
