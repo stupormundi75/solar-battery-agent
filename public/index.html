@@ -153,6 +153,12 @@
     </div>
   </div>
 
+  <!-- Charging windows banner -->
+  <div id="windows-card" class="card grid-full" style="display:none;margin-bottom:16px;">
+    <div class="card-label">Tonight's Forced Charging Windows</div>
+    <div id="windows-content" style="margin-top:8px;font-family:'DM Mono',monospace;font-size:13px;"></div>
+  </div>
+
   <!-- 48h Schedule -->
   <div class="card grid-full">
     <div class="card-label">48h Schedule</div>
@@ -283,7 +289,7 @@ function renderDayBars(schedule, containerId, hoursId, currentHour, isTodayDay, 
 
     if (type === 'timeline') {
       h   = x.mode === 'normal' ? 12 : Math.max((x.ghi_W_m2/maxVal)*96, 12);
-      bg  = x.mode==='solar'?'var(--solar)':x.mode==='grid_charge'?'var(--grid)':'var(--bg3)';
+      bg  = x.mode==='solar'?'var(--solar)':x.mode==='grid_charge'?'var(--grid)':x.in_window?'var(--grid)':'var(--bg3)';
       cls = x.mode;
       lbl = x.ghi_W_m2 > 0 ? x.ghi_W_m2.toFixed(0) : '';
     } else if (type === 'price') {
@@ -374,6 +380,23 @@ function render(d) {
   gEl.textContent = d.ghi_W_m2 != null ? d.ghi_W_m2.toFixed(0) : '—';
   gEl.style.color = d.mode==='solar'?'var(--solar)':'var(--text)';
 
+  // Charging windows card
+  const winCard = document.getElementById('windows-card');
+  const winContent = document.getElementById('windows-content');
+  if (d.windows && d.windows.length > 0) {
+    winCard.style.display = 'block';
+    winContent.innerHTML = d.windows.map((w, i) => {
+      return '<div style="margin-bottom:6px;">' +
+        '<span style="color:var(--grid)">⚡ Window ' + (i+1) + ':</span> ' +
+        String(w.start_h).padStart(2,'0') + ':00 → ' +
+        String(w.end_h).padStart(2,'0') + ':00 ' +
+        '<span style="color:var(--muted)">target ' + w.target_soc + '% SOC</span>' +
+        '</div>';
+    }).join('');
+  } else {
+    winCard.style.display = 'none';
+  }
+
   const st = d.schedule      || [];
   const sm = d.schedule_tmrw || [];
 
@@ -387,6 +410,15 @@ function render(d) {
       noteEl.textContent = "Tomorrow: grid charge at " +
         cheap.map(x=>`${String(x.hour).padStart(2,'0')}:00`).join(', ');
     }
+  }
+
+  // Mark hours that fall inside charging windows
+  if (d.windows && d.windows.length > 0) {
+    st.forEach(slot => {
+      slot.in_window = d.windows.some(w =>
+        slot.hour >= w.start_h && slot.hour < w.end_h);
+      if (slot.in_window && slot.mode === 'normal') slot.mode = 'grid_charge';
+    });
   }
 
   // Render all three chart types for both days
