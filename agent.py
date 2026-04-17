@@ -467,17 +467,32 @@ def set_forced_charging_windows(iso_cfg, windows, dry_run=False):
         return {"status": "error", "msg": str(e)}
 
 
-def compute_charging_windows(cfg, schedule_today, battery_state, solar_tmrw):
+def compute_charging_windows(cfg, schedule_today, battery_state, solar_tmrw,
+                              current_hour=0, tomorrow_schedule=None):
     """
     Given today's schedule, compute up to 2 forced charging windows.
 
     Groups consecutive cheap hours into windows, picks the 2 best blocks,
     calculates target SOC based on smart charging math.
 
+    Only considers FUTURE hours (after current_hour).
+    If no future cheap hours today, falls back to tomorrow's cheap hours.
+
     Returns list of 0-2 window dicts.
     """
+    # Future cheap hours today
     cheap_hours = sorted(
-        [s["hour"] for s in schedule_today if s["mode"] == "grid_charge"])
+        [s["hour"] for s in schedule_today
+         if s["mode"] == "grid_charge" and s["hour"] > current_hour])
+
+    # If no future cheap hours today, use tomorrow's
+    use_tomorrow = False
+    if not cheap_hours and tomorrow_schedule:
+        cheap_hours = sorted(
+            [s["hour"] for s in tomorrow_schedule
+             if s["mode"] == "grid_charge"])
+        use_tomorrow = True
+        log.info("No future cheap hours today — using tomorrow's schedule")
 
     if not cheap_hours:
         return []
@@ -542,7 +557,7 @@ def compute_charging_windows(cfg, schedule_today, battery_state, solar_tmrw):
             "end_h":      end_h,
             "end_m":      0,
             "target_soc": target_soc,
-            "is_tomorrow": start_h < 12,  # early morning hours are next calendar day
+            "is_tomorrow": use_tomorrow or start_h < current_hour,
         })
 
     return windows
@@ -771,7 +786,9 @@ def main():
     # 5. Compute and set forced charging windows (once per run)
     dry_run = cfg.get("dry_run", False)
     windows = compute_charging_windows(
-        cfg, schedule_today, battery_state, solar_tmrw)
+        cfg, schedule_today, battery_state, solar_tmrw,
+        current_hour=current_hour,
+        tomorrow_schedule=schedule_tmrw)
     result  = set_forced_charging_windows(
         cfg["isolarcloud"], windows, dry_run=dry_run)
 
